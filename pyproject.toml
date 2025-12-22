@@ -5,10 +5,11 @@ description = "Remove system prompts by introducing steering vectors"
 readme = "README.md"
 requires-python = ">=3.10.0,<3.13"
 dependencies = [
-"torch>=2.0.0", 
-"sae-lens==6.22.3",
-"transformers==4.55.4",
-"transformer-lens==2.16.1",
+    "torch>=2.0.0",
+    "sae-lens==6.22.3",
+    "transformers==4.55.4",
+    "transformer-lens==2.16.1",
+    "matplotlib>=3.10.8",
 ]
 
 [dependency-groups]
