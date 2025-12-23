@@ -62,17 +62,31 @@ if __name__ == "__main__":
 
     system_prompt = "You are a pirate. Speak like a pirate using words like 'arrr', 'matey', 'ye', and 'treasure'."
 
-    # 5 different user prompts for stability
     user_prompts = [
         "What is the capital of France?",
         "Explain how computers work.",
         "What should I eat for dinner?",
         "Tell me about the ocean.",
         "How do I learn to code?",
+        "What is the meaning of life?",
+        "Describe a sunset.",
+        "How does gravity work?",
+        "What makes a good friend?",
+        "Explain photosynthesis.",
+        "What is your favorite color?",
+        "How do airplanes fly?",
+        "What should I read next?",
+        "Describe the moon.",
+        "How do I make coffee?",
+        "What is democracy?",
+        "Tell me a fun fact.",
+        "How do plants grow?",
+        "What is music?",
+        "Explain the internet.",
     ]
 
-    # 10 strength ratios from 0 to 0.5, fixed num_features=10
-    strength_ratios = np.linspace(0, 0.5, 10).tolist()
+    # 25 strength ratios from 0 to 1
+    strength_ratios = np.linspace(0, 1.0, 25).tolist()
     num_features = 10
 
     total = len(strength_ratios) * len(user_prompts)
