@@ -29,6 +29,39 @@ def get_ground_truth_activations(
     return F.relu(activations)
 
 
+def get_averaged_activations(
+    system_prompt: str,
+    user_prompts: list[str],
+    model: HookedTransformer,
+    sae: SAE,
+) -> torch.Tensor:
+    """Get feature activations averaged over multiple formatted prompts.
+    
+    Instead of extracting features from system prompt alone, this runs
+    the model on format_gemma_chat(system_prompt, user_prompt) for each
+    user prompt and averages the resulting feature activations.
+    """
+    all_activations = []
+    
+    for user_prompt in user_prompts:
+        formatted = format_gemma_chat(system_prompt, user_prompt)
+        _, cache = model.run_with_cache([formatted])
+        resid = cache[sae.cfg.metadata.hook_name][:, 1:, :]
+        
+        base_activations = torch.load("data/base_vec.pt", map_location=resid.device)
+        
+        feature_acts = sae.encode(resid)
+        differential_acts = feature_acts - base_activations
+        activations, _ = differential_acts.max(dim=1)  # max over sequence
+        all_activations.append(F.relu(activations))
+    
+    # Stack and average over all user prompts
+    stacked = torch.stack(all_activations, dim=0)  # [num_prompts, d_sae]
+    averaged = stacked.mean(dim=0)  # [d_sae]
+    
+    return averaged
+
+
 def generate_steered(
     model: HookedTransformer,
     sae: SAE,

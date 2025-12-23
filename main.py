@@ -115,21 +115,19 @@ def save_run_output(
 def run_experiment(
     model,
     sae,
-    system_prompt,
     user_prompt,
     strength_ratio,
     num_features,
     system_output: str,
     sys_emb: torch.Tensor,
+    steering_data: torch.Tensor,
 ):
     """Run one steered generation and compare against precomputed system output."""
     from steering.generate import (
         format_gemma_user_only,
         generate_steered,
-        get_ground_truth_activations,
     )
 
-    steering_data = get_ground_truth_activations([system_prompt], model, sae)
     formatted_user_prompt = format_gemma_user_only(user_prompt)
     steered_raw, top_feature_indices, top_feature_strengths = generate_steered(
         model,
@@ -161,33 +159,35 @@ if __name__ == "__main__":
     model, sae = load_hooked_model(config, device="cpu")
     print(f"Model load time: {time.time() - t0:.1f}s")
 
-    system_prompt = "You are an ironic and sarcastic teenager. All of your responses will be the style of these characters."
+    system_prompt = (
+        "You are angry and frustrated. All your responses should reflect your anger."
+    )
 
     user_prompts = [
         "What is the capital of France?",
         "Explain how computers work.",
-        # "What should I eat for dinner?",
-        # "Tell me about the ocean.",
-        # "How do I learn to code?",
-        # "What is the meaning of life?",
-        # "Describe a sunset.",
-        # "How does gravity work?",
-        # "What makes a good friend?",
-        # "Explain photosynthesis.",
-        # "What is your favorite color?",
-        # "How do airplanes fly?",
-        # "What should I read next?",
-        # "Describe the moon.",
-        # "How do I make coffee?",
-        # "What is democracy?",
-        # "Tell me a fun fact.",
-        # "How do plants grow?",
-        # "What is music?",
-        # "Explain the internet.",
+        "What should I eat for dinner?",
+        "Tell me about the ocean.",
+        "How do I learn to code?",
+        "What is the meaning of life?",
+        "Describe a sunset.",
+        "How does gravity work?",
+        "What makes a good friend?",
+        "Explain photosynthesis.",
+        "What is your favorite color?",
+        "How do airplanes fly?",
+        "What should I read next?",
+        "Describe the moon.",
+        "How do I make coffee?",
+        "What is democracy?",
+        "Tell me a fun fact.",
+        "How do plants grow?",
+        "What is music?",
+        "Explain the internet.",
     ]
 
     # 25 strength ratios from 0 to 1
-    strength_ratios = np.linspace(0, 1.0, 5).tolist()
+    strength_ratios = np.linspace(0, 1.0, 25).tolist()
     num_features = 10
 
     total = len(strength_ratios) * len(user_prompts)
@@ -204,18 +204,16 @@ if __name__ == "__main__":
     layer_num = sae_id.split(".")[1]
     layer = f"{layer_num}-res-jb"
 
-    # Get top features once (same for all since same system prompt)
-    initial_result = compare_outputs(
-        model,
-        sae,
-        system_prompt,
-        user_prompts[0],
-        strength_ratio=1.0,
-        max_new_tokens=40,
-        num_features=num_features,
-    )
-    top_indices = initial_result.get("top_feature_indices", [])
-    top_strengths = initial_result.get("top_feature_strengths", [])
+    # Compute averaged steering data over all user prompts
+    from steering.generate import get_averaged_activations, generate_steered, format_gemma_user_only
+    
+    print("\nComputing averaged feature activations over all user prompts...")
+    steering_data = get_averaged_activations(system_prompt, user_prompts, model, sae)
+    
+    # Get top features from the averaged activations
+    topk = torch.topk(steering_data.squeeze(0), k=num_features)
+    top_strengths = topk.values.tolist()
+    top_indices = topk.indices.tolist()
 
     # Build features with descriptions once
     features_with_desc = []
@@ -271,12 +269,12 @@ if __name__ == "__main__":
             result = run_experiment(
                 model,
                 sae,
-                system_prompt,
                 user_prompt,
                 strength,
                 num_features,
                 system_output=system_outputs[prompt_idx],
                 sys_emb=system_embeddings[prompt_idx],
+                steering_data=steering_data,
             )
             cosines.append(result["distances"]["cosine_similarity"])
             l2s.append(result["distances"]["l2_distance"])
