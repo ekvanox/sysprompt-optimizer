@@ -12,8 +12,7 @@ import numpy as np
 
 from steering.generate import (
     _extract_response,
-    compare_outputs,
-    generate_with_system_prompt,
+    generate_with_activations,
 )
 from utils.loading import load_config, load_hooked_model
 from utils.neuronpedia import format_feature_list, lookup_features
@@ -159,9 +158,7 @@ if __name__ == "__main__":
     model, sae = load_hooked_model(config, device="cpu")
     print(f"Model load time: {time.time() - t0:.1f}s")
 
-    system_prompt = (
-        "You are angry and frustrated. All your responses should reflect your anger."
-    )
+    system_prompt = "You are a Chinese assistant. You must only respond in Chinese, never in English."
 
     user_prompts = [
         "What is the capital of France?",
@@ -204,29 +201,6 @@ if __name__ == "__main__":
     layer_num = sae_id.split(".")[1]
     layer = f"{layer_num}-res-jb"
 
-    # Compute averaged steering data over all user prompts
-    from steering.generate import get_averaged_activations, generate_steered, format_gemma_user_only
-    
-    print("\nComputing averaged feature activations over all user prompts...")
-    steering_data = get_averaged_activations(system_prompt, user_prompts, model, sae)
-    
-    # Get top features from the averaged activations
-    topk = torch.topk(steering_data.squeeze(0), k=num_features)
-    top_strengths = topk.values.tolist()
-    top_indices = topk.indices.tolist()
-
-    # Build features with descriptions once
-    features_with_desc = []
-    if top_indices:
-        for i, f in enumerate(lookup_features(model_id, layer, top_indices)):
-            features_with_desc.append(
-                {
-                    "index": f["index"],
-                    "strength": top_strengths[i] if i < len(top_strengths) else 0.0,
-                    "description": f["description"],
-                }
-            )
-
     print("\n" + "=" * 80)
     print(
         f"Running sweep: {len(strength_ratios)} strengths x {len(user_prompts)} prompts"
@@ -243,18 +217,44 @@ if __name__ == "__main__":
         "l2_std": [],
     }
 
-    # Pre-generate system outputs once per prompt (they don't change with strength)
-    print("\nPre-generating system prompt outputs...")
+    # Pre-generate system outputs AND collect activations in one pass
+    print("\nPre-generating system outputs and computing feature activations...")
     system_outputs = {}
     system_embeddings = {}
+    all_activations = []
     for prompt_idx, user_prompt in enumerate(user_prompts):
         print(f"  [{prompt_idx + 1}/{len(user_prompts)}] '{user_prompt[:40]}...'")
-        raw_output = generate_with_system_prompt(
-            model, system_prompt, user_prompt, max_new_tokens=40
+        raw_output, activations = generate_with_activations(
+            model, sae, system_prompt, user_prompt, max_new_tokens=40
         )
         sys_response = _extract_response(raw_output)
         system_outputs[prompt_idx] = sys_response
         system_embeddings[prompt_idx] = get_embedding(sys_response, model, sae)
+        all_activations.append(activations)
+
+    # Average activations across all prompts
+    steering_data = torch.stack(all_activations, dim=0).mean(dim=0)
+
+    # Get top features from the averaged activations
+    topk = torch.topk(steering_data, k=num_features)
+    top_strengths = topk.values.tolist()
+    top_indices = topk.indices.tolist()
+
+    # Build features with descriptions once
+    features_with_desc = []
+    if top_indices:
+        for i, f in enumerate(lookup_features(model_id, layer, top_indices)):
+            features_with_desc.append(
+                {
+                    "index": f["index"],
+                    "strength": top_strengths[i] if i < len(top_strengths) else 0.0,
+                    "description": f["description"],
+                }
+            )
+
+    print(f"\nTop {num_features} features (averaged over {len(user_prompts)} prompts):")
+    for feat in features_with_desc[:5]:
+        print(f"  [{feat['index']}] {feat['strength']:.2f} - {feat['description'][:60]}")
 
     print("\nRunning strength sweep...")
     for strength_idx, strength in enumerate(strength_ratios):

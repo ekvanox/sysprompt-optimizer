@@ -36,29 +36,29 @@ def get_averaged_activations(
     sae: SAE,
 ) -> torch.Tensor:
     """Get feature activations averaged over multiple formatted prompts.
-    
+
     Instead of extracting features from system prompt alone, this runs
     the model on format_gemma_chat(system_prompt, user_prompt) for each
     user prompt and averages the resulting feature activations.
     """
     all_activations = []
-    
+
     for user_prompt in user_prompts:
         formatted = format_gemma_chat(system_prompt, user_prompt)
         _, cache = model.run_with_cache([formatted])
         resid = cache[sae.cfg.metadata.hook_name][:, 1:, :]
-        
+
         base_activations = torch.load("data/base_vec.pt", map_location=resid.device)
-        
+
         feature_acts = sae.encode(resid)
         differential_acts = feature_acts - base_activations
         activations, _ = differential_acts.max(dim=1)  # max over sequence
         all_activations.append(F.relu(activations))
-    
+
     # Stack and average over all user prompts
     stacked = torch.stack(all_activations, dim=0)  # [num_prompts, d_sae]
     averaged = stacked.mean(dim=0)  # [d_sae]
-    
+
     return averaged
 
 
@@ -105,6 +105,39 @@ def generate_with_system_prompt(
     return model.generate(
         formatted_prompt, max_new_tokens=max_new_tokens, verbose=False, temperature=0
     )
+
+
+def generate_with_activations(
+    model: HookedTransformer,
+    sae: SAE,
+    system_prompt: str,
+    user_prompt: str,
+    max_new_tokens: int = 50,
+) -> tuple[str, torch.Tensor]:
+    """Generate response and return feature activations from the input prompt.
+
+    This combines generation with activation extraction to avoid running
+    the model twice on the same input.
+    """
+    formatted_prompt = format_gemma_chat(system_prompt, user_prompt)
+
+    # First get activations from the input (before generation)
+    _, cache = model.run_with_cache([formatted_prompt])
+    resid = cache[sae.cfg.metadata.hook_name][:, 1:, :]
+
+    base_activations = torch.load("data/base_vec.pt", map_location=resid.device)
+
+    feature_acts = sae.encode(resid)
+    differential_acts = feature_acts - base_activations
+    activations, _ = differential_acts.max(dim=1)  # max over sequence
+    activations = F.relu(activations)
+
+    # Then generate the response
+    output = model.generate(
+        formatted_prompt, max_new_tokens=max_new_tokens, verbose=False, temperature=0
+    )
+
+    return output, activations.squeeze(0)
 
 
 def compare_outputs(
