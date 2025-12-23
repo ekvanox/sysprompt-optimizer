@@ -38,17 +38,14 @@ def generate_steered(
     max_new_tokens: int = 50,
     num_features: int = 5,
 ):
-    # steering_data shape: [1, d_sae], squeeze batch dim for single prompt
-    steering_data = steering_data.squeeze(0)  # [d_sae]
+    steering_data = steering_data.squeeze(0)
 
     topk = torch.topk(steering_data, k=num_features)
-    values, indices = topk.values, topk.indices  # both [num_features]
+    values, indices = topk.values, topk.indices
 
-    feature_directions = sae.W_dec[indices]  # [num_features, d_model]
-    weighted_direction = feature_directions * values.unsqueeze(
-        -1
-    )  # [num_features, d_model]
-    concept_vector = weighted_direction.sum(dim=0)  # [d_model]
+    feature_directions = sae.W_dec[indices]
+    weighted_direction = feature_directions * values.unsqueeze(-1)
+    concept_vector = weighted_direction.sum(dim=0)
     concept_vector = concept_vector / concept_vector.norm()
 
     def adaptive_hook(resid, hook):
@@ -57,9 +54,11 @@ def generate_steered(
         return resid + steering_vec
 
     with model.hooks(fwd_hooks=[(sae.cfg.metadata.hook_name, adaptive_hook)]):
-        output = model.generate(prompt, max_new_tokens=max_new_tokens, verbose=False)
+        output = model.generate(
+            prompt, max_new_tokens=max_new_tokens, verbose=False, temperature=0
+        )
 
-    return output
+    return output, indices.tolist(), values.tolist()
 
 
 def generate_with_system_prompt(
@@ -71,7 +70,7 @@ def generate_with_system_prompt(
     """Generate response using traditional system prompt injection."""
     formatted_prompt = format_gemma_chat(system_prompt, user_prompt)
     return model.generate(
-        formatted_prompt, max_new_tokens=max_new_tokens, verbose=False
+        formatted_prompt, max_new_tokens=max_new_tokens, verbose=False, temperature=0
     )
 
 
@@ -84,22 +83,13 @@ def compare_outputs(
     max_new_tokens: int = 50,
     num_features: int = 5,
 ) -> dict:
-    """
-    Compare generation using system prompt vs feature vector steering.
-
-    Returns a dict with both outputs for side-by-side comparison.
-    """
-    # Method 1: Traditional system prompt
     system_output = generate_with_system_prompt(
         model, system_prompt, user_prompt, max_new_tokens
     )
 
-    # Method 2: Extract features from system prompt and steer
     steering_data = get_ground_truth_activations([system_prompt], model, sae)
-
-    # Format user prompt without system prompt for steered generation
     formatted_user_prompt = format_gemma_user_only(user_prompt)
-    steered_output = generate_steered(
+    steered_output, top_feature_indices, top_feature_strengths = generate_steered(
         model,
         sae,
         steering_data,
@@ -114,6 +104,8 @@ def compare_outputs(
         "user_prompt": user_prompt,
         "system_output": system_output,
         "steered_output": steered_output,
+        "top_feature_indices": top_feature_indices,
+        "top_feature_strengths": top_feature_strengths,
     }
 
 
