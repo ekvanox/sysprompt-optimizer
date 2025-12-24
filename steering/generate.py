@@ -24,7 +24,7 @@ def get_ground_truth_activations(
 
     feature_acts = sae.encode(resid)
     differential_acts = feature_acts - base_activations
-    activations, _ = differential_acts.max(dim=1)
+    activations = differential_acts.mean(dim=1)  # mean over sequence
 
     return F.relu(activations)
 
@@ -52,7 +52,7 @@ def get_averaged_activations(
 
         feature_acts = sae.encode(resid)
         differential_acts = feature_acts - base_activations
-        activations, _ = differential_acts.max(dim=1)  # max over sequence
+        activations = differential_acts.mean(dim=1)  # mean over sequence
         all_activations.append(F.relu(activations))
 
     # Stack and average over all user prompts
@@ -129,7 +129,7 @@ def generate_with_activations(
 
     feature_acts = sae.encode(resid)
     differential_acts = feature_acts - base_activations
-    activations, _ = differential_acts.max(dim=1)  # max over sequence
+    activations = differential_acts.mean(dim=1)  # mean over sequence
     activations = F.relu(activations)
 
     # Then generate the response

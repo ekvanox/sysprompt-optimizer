@@ -158,7 +158,7 @@ if __name__ == "__main__":
     model, sae = load_hooked_model(config, device="cpu")
     print(f"Model load time: {time.time() - t0:.1f}s")
 
-    system_prompt = "You are a Chinese assistant. You must only respond in Chinese, never in English."
+    system_prompt = "You are a pirate. Speak like a pirate using only words like 'arr', 'scallywag', 'matey', 'treasure', etc."
 
     user_prompts = [
         "What is the capital of France?",
@@ -232,29 +232,48 @@ if __name__ == "__main__":
         system_embeddings[prompt_idx] = get_embedding(sys_response, model, sae)
         all_activations.append(activations)
 
-    # Average activations across all prompts
-    steering_data = torch.stack(all_activations, dim=0).mean(dim=0)
+    # Find intersection of features (active in >= 90% of prompts)
+    stacked = torch.stack(all_activations, dim=0)  # [num_prompts, d_sae]
+    activation_threshold = 0.1  # Consider feature "active" if above this value
+    active_mask = stacked > activation_threshold  # [num_prompts, d_sae]
+    active_count = active_mask.sum(dim=0)  # [d_sae] - count per feature
 
-    # Get top features from the averaged activations
-    topk = torch.topk(steering_data, k=num_features)
+    min_active = int(0.9 * len(user_prompts))  # 90% threshold
+    intersection_mask = active_count >= min_active  # Features active in >= 90%
+
+    # For features in intersection, use mean activation as strength
+    mean_activations = stacked.mean(dim=0)
+    intersection_activations = mean_activations * intersection_mask.float()
+
+    # Get top features from intersection
+    topk = torch.topk(intersection_activations, k=num_features)
     top_strengths = topk.values.tolist()
     top_indices = topk.indices.tolist()
+
+    # Build steering data using intersection features
+    steering_data = intersection_activations
 
     # Build features with descriptions once
     features_with_desc = []
     if top_indices:
         for i, f in enumerate(lookup_features(model_id, layer, top_indices)):
+            count_active = active_count[top_indices[i]].item()
             features_with_desc.append(
                 {
                     "index": f["index"],
                     "strength": top_strengths[i] if i < len(top_strengths) else 0.0,
+                    "active_in": f"{count_active}/{len(user_prompts)}",
                     "description": f["description"],
                 }
             )
 
-    print(f"\nTop {num_features} features (averaged over {len(user_prompts)} prompts):")
+    print(
+        f"\nTop {num_features} features (intersection, active in >= {min_active}/{len(user_prompts)} prompts):"
+    )
     for feat in features_with_desc[:5]:
-        print(f"  [{feat['index']}] {feat['strength']:.2f} - {feat['description'][:60]}")
+        print(
+            f"  [{feat['index']}] {feat['strength']:.2f} ({feat['active_in']}) - {feat['description'][:50]}"
+        )
 
     print("\nRunning strength sweep...")
     for strength_idx, strength in enumerate(strength_ratios):
