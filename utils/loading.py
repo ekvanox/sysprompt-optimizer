@@ -1,16 +1,18 @@
+"""Utility functions for loading models and configs."""
+
 import torch
 import yaml
-from sae_lens import SAE
 from transformer_lens import HookedTransformer
 
 
-def load_config(config_path: str):
+def load_config(config_path: str) -> dict:
+    """Load configuration from YAML file."""
     with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-    return config
+        return yaml.safe_load(f)
 
 
 def get_device() -> str:
+    """Get the best available device."""
     if torch.cuda.is_available():
         return "cuda"
     elif torch.backends.mps.is_available():
@@ -18,12 +20,10 @@ def get_device() -> str:
     return "cpu"
 
 
-def load_hooked_model(config: dict, device: str | None = None):
+def load_model(config: dict, device: str | None = None) -> HookedTransformer:
+    """Load the HookedTransformer model."""
     if device is None:
         device = get_device()
     print(f"Using device: {device}")
-    release = config["model"]["sae"]["name"]
-    sae_id = config["model"]["sae"]["sae_id"]
-    sae = SAE.from_pretrained(release, sae_id, device=device)
     model = HookedTransformer.from_pretrained(config["model"]["name"], device=device)
-    return model, sae
+    return model

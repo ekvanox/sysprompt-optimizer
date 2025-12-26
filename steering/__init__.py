@@ -1,21 +1,15 @@
 from .generate import (
-    compare_outputs,
+    extract_response,
     format_gemma_chat,
     format_gemma_user_only,
+    generate_and_capture_activations,
     generate_steered,
-    generate_with_system_prompt,
-    get_ground_truth_activations,
-    print_comparison,
-    run_comparison_suite,
 )
 
 __all__ = [
-    "compare_outputs",
+    "extract_response",
     "format_gemma_chat",
     "format_gemma_user_only",
+    "generate_and_capture_activations",
     "generate_steered",
-    "generate_with_system_prompt",
-    "get_ground_truth_activations",
-    "print_comparison",
-    "run_comparison_suite",
 ]

@@ -1,11 +1,13 @@
+"""Generation functions with residual stream activation capture and steering."""
+
 import torch
-import torch.nn.functional as F
-from sae_lens import SAE
 from transformer_lens import HookedTransformer
+
+DEFAULT_HOOK_NAME = "blocks.15.hook_resid_post"
 
 
 def format_gemma_chat(system_prompt: str, user_prompt: str) -> str:
-    """Format prompts for Gemma instruction-tuned model."""
+    """Format prompts for Gemma instruction-tuned model with system prompt."""
     return f"<start_of_turn>user\n{system_prompt}\n\n{user_prompt}<end_of_turn>\n<start_of_turn>model\n"
 
 
@@ -14,252 +16,59 @@ def format_gemma_user_only(user_prompt: str) -> str:
     return f"<start_of_turn>user\n{user_prompt}<end_of_turn>\n<start_of_turn>model\n"
 
 
-def get_ground_truth_activations(
-    text_batch: list[str], model: HookedTransformer, sae: SAE
-) -> torch.Tensor:
-    _, cache = model.run_with_cache(text_batch)
-    resid = cache[sae.cfg.metadata.hook_name][:, 1:, :]
-
-    base_activations = torch.load("data/base_vec.pt", map_location=resid.device)
-
-    feature_acts = sae.encode(resid)
-    differential_acts = feature_acts - base_activations
-    activations = differential_acts.mean(dim=1)  # mean over sequence
-
-    return F.relu(activations)
-
-
-def get_averaged_activations(
-    system_prompt: str,
-    user_prompts: list[str],
+def generate_and_capture_activations(
     model: HookedTransformer,
-    sae: SAE,
-) -> torch.Tensor:
-    """Get feature activations averaged over multiple formatted prompts.
-
-    Instead of extracting features from system prompt alone, this runs
-    the model on format_gemma_chat(system_prompt, user_prompt) for each
-    user prompt and averages the resulting feature activations.
-    """
+    prompt: str,
+    max_new_tokens: int = 50,
+    hook_name: str = DEFAULT_HOOK_NAME,
+) -> tuple[str, torch.Tensor]:
+    """Generate tokens and capture mean residual stream activation."""
     all_activations = []
 
-    for user_prompt in user_prompts:
-        formatted = format_gemma_chat(system_prompt, user_prompt)
-        _, cache = model.run_with_cache([formatted])
-        resid = cache[sae.cfg.metadata.hook_name][:, 1:, :]
+    def capture_hook(resid, hook):
+        all_activations.append(resid[:, -1, :].detach().clone())
+        return resid
 
-        base_activations = torch.load("data/base_vec.pt", map_location=resid.device)
-
-        feature_acts = sae.encode(resid)
-        differential_acts = feature_acts - base_activations
-        activations = differential_acts.mean(dim=1)  # mean over sequence
-        all_activations.append(F.relu(activations))
-
-    # Stack and average over all user prompts
-    stacked = torch.stack(all_activations, dim=0)  # [num_prompts, d_sae]
-    averaged = stacked.mean(dim=0)  # [d_sae]
-
-    return averaged
-
-
-def generate_steered(
-    model: HookedTransformer,
-    sae: SAE,
-    steering_data: torch.Tensor,
-    prompt: str,
-    strength_ratio: float = 0.1,
-    max_new_tokens: int = 50,
-    num_features: int = 5,
-):
-    steering_data = steering_data.squeeze(0)
-
-    topk = torch.topk(steering_data, k=num_features)
-    values, indices = topk.values, topk.indices
-
-    feature_directions = sae.W_dec[indices]
-    weighted_direction = feature_directions * values.unsqueeze(-1)
-    concept_vector = weighted_direction.sum(dim=0)
-    concept_vector = concept_vector / concept_vector.norm()
-
-    def adaptive_hook(resid, hook):
-        current_norm = resid.norm(dim=-1).mean()
-        steering_vec = concept_vector * current_norm * strength_ratio
-        return resid + steering_vec
-
-    with model.hooks(fwd_hooks=[(sae.cfg.metadata.hook_name, adaptive_hook)]):
+    with model.hooks(fwd_hooks=[(hook_name, capture_hook)]):
         output = model.generate(
             prompt, max_new_tokens=max_new_tokens, verbose=False, temperature=0
         )
 
-    return output, indices.tolist(), values.tolist()
+    if all_activations:
+        stacked = torch.stack(all_activations, dim=0).squeeze(1)
+        mean_activation = stacked.mean(dim=0)
+    else:
+        mean_activation = torch.zeros(model.cfg.d_model)
+
+    return output, mean_activation
 
 
-def generate_with_system_prompt(
+def generate_steered(
     model: HookedTransformer,
-    system_prompt: str,
-    user_prompt: str,
+    prompt: str,
+    steering_vec: torch.Tensor,
+    strength: float = 0.5,
     max_new_tokens: int = 50,
+    hook_name: str = DEFAULT_HOOK_NAME,
 ) -> str:
-    """Generate response using traditional system prompt injection."""
-    formatted_prompt = format_gemma_chat(system_prompt, user_prompt)
-    return model.generate(
-        formatted_prompt, max_new_tokens=max_new_tokens, verbose=False, temperature=0
-    )
+    """Generate with steering vector added to residual stream."""
+    steering_vec_normalized = steering_vec / steering_vec.norm()
+
+    def steering_hook(resid, hook):
+        current_norm = resid.norm(dim=-1).mean()
+        return resid + steering_vec_normalized * current_norm * strength
+
+    with model.hooks(fwd_hooks=[(hook_name, steering_hook)]):
+        output = model.generate(
+            prompt, max_new_tokens=max_new_tokens, verbose=False, temperature=0
+        )
+    return output
 
 
-def generate_with_activations(
-    model: HookedTransformer,
-    sae: SAE,
-    system_prompt: str,
-    user_prompt: str,
-    max_new_tokens: int = 50,
-) -> tuple[str, torch.Tensor]:
-    """Generate response and return feature activations from the input prompt.
-
-    This combines generation with activation extraction to avoid running
-    the model twice on the same input.
-    """
-    formatted_prompt = format_gemma_chat(system_prompt, user_prompt)
-
-    # First get activations from the input (before generation)
-    _, cache = model.run_with_cache([formatted_prompt])
-    resid = cache[sae.cfg.metadata.hook_name][:, 1:, :]
-
-    base_activations = torch.load("data/base_vec.pt", map_location=resid.device)
-
-    feature_acts = sae.encode(resid)
-    differential_acts = feature_acts - base_activations
-    activations = differential_acts.mean(dim=1)  # mean over sequence
-    activations = F.relu(activations)
-
-    # Then generate the response
-    output = model.generate(
-        formatted_prompt, max_new_tokens=max_new_tokens, verbose=False, temperature=0
-    )
-
-    return output, activations.squeeze(0)
-
-
-def compare_outputs(
-    model: HookedTransformer,
-    sae: SAE,
-    system_prompt: str,
-    user_prompt: str,
-    strength_ratio: float = 0.1,
-    max_new_tokens: int = 50,
-    num_features: int = 5,
-) -> dict:
-    system_output = generate_with_system_prompt(
-        model, system_prompt, user_prompt, max_new_tokens
-    )
-
-    steering_data = get_ground_truth_activations([system_prompt], model, sae)
-    formatted_user_prompt = format_gemma_user_only(user_prompt)
-    steered_output, top_feature_indices, top_feature_strengths = generate_steered(
-        model,
-        sae,
-        steering_data,
-        formatted_user_prompt,
-        strength_ratio=strength_ratio,
-        max_new_tokens=max_new_tokens,
-        num_features=num_features,
-    )
-
-    return {
-        "system_prompt": system_prompt,
-        "user_prompt": user_prompt,
-        "system_output": system_output,
-        "steered_output": steered_output,
-        "top_feature_indices": top_feature_indices,
-        "top_feature_strengths": top_feature_strengths,
-    }
-
-
-def _extract_response(text: str) -> str:
+def extract_response(text: str) -> str:
     """Extract just the model response, removing prompt formatting."""
     if "model" in text:
         parts = text.split("model")
         if len(parts) > 1:
             return parts[-1].strip()
     return text
-
-
-def print_comparison(result: dict, width: int = 80) -> None:
-    sep = "=" * width
-    half_width = (width - 3) // 2
-
-    print(f"\n{sep}")
-    print(f"SYSTEM PROMPT: {result['system_prompt']}")
-    print(f"USER PROMPT: {result['user_prompt']}")
-    print(sep)
-
-    print(
-        f"\n{'WITH SYSTEM PROMPT':<{half_width}} | {'WITH FEATURE STEERING':<{half_width}}"
-    )
-    print("-" * width)
-
-    sys_response = _extract_response(result["system_output"])
-    steer_response = _extract_response(result["steered_output"])
-
-    sys_lines = _wrap_text(sys_response, half_width)
-    steer_lines = _wrap_text(steer_response, half_width)
-
-    max_lines = max(len(sys_lines), len(steer_lines))
-
-    for i in range(max_lines):
-        left = sys_lines[i] if i < len(sys_lines) else ""
-        right = steer_lines[i] if i < len(steer_lines) else ""
-        print(f"{left:<{half_width}} | {right:<{half_width}}")
-
-    print(sep + "\n")
-
-
-def _wrap_text(text: str, width: int) -> list[str]:
-    """Wrap text to specified width."""
-    words = text.split()
-    lines = []
-    current_line = ""
-
-    for word in words:
-        if len(current_line) + len(word) + 1 <= width:
-            current_line = f"{current_line} {word}".strip()
-        else:
-            if current_line:
-                lines.append(current_line)
-            current_line = word[:width]  # truncate very long words
-
-    if current_line:
-        lines.append(current_line)
-
-    return lines if lines else [""]
-
-
-def run_comparison_suite(
-    model: HookedTransformer,
-    sae: SAE,
-    system_prompt: str,
-    user_prompts: list[str],
-    strength_ratio: float = 0.1,
-    max_new_tokens: int = 50,
-    num_features: int = 5,
-) -> list[dict]:
-    """
-    Run comparisons across multiple user prompts with the same system prompt.
-    Returns list of comparison results.
-    """
-    results = []
-    for user_prompt in user_prompts:
-        print(f"\n🔄 Processing: '{user_prompt[:50]}...'")
-        result = compare_outputs(
-            model,
-            sae,
-            system_prompt,
-            user_prompt,
-            strength_ratio=strength_ratio,
-            max_new_tokens=max_new_tokens,
-            num_features=num_features,
-        )
-        results.append(result)
-        print_comparison(result)
-
-    return results

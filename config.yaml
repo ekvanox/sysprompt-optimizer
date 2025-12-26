@@ -1,5 +1,3 @@
 model: 
   name: gemma-2b-it
-  sae:
-    name: gemma-2b-it-res-jb
-    sae_id: blocks.12.hook_resid_post
+  hook_name: blocks.12.hook_resid_post

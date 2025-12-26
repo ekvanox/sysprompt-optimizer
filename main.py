@@ -1,165 +1,83 @@
+"""Main script for steering vector extraction and evaluation."""
+
 import json
 import os
 import time
 from datetime import datetime
 
-import matplotlib
+import numpy as np
 import torch
 
-matplotlib.use("Agg")  # Non-interactive backend
-import matplotlib.pyplot as plt
-import numpy as np
-
 from steering.generate import (
-    _extract_response,
-    generate_with_activations,
+    extract_response,
+    format_gemma_chat,
+    format_gemma_user_only,
+    generate_and_capture_activations,
+    generate_steered,
 )
-from utils.loading import load_config, load_hooked_model
-from utils.neuronpedia import format_feature_list, lookup_features
+from utils.loading import load_config, load_model
+from utils.plotting import plot_sweep_results
 
-# Ensure logs directory exists
 LOGS_DIR = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 
-def get_embedding(text: str, model, sae) -> torch.Tensor:
+def compute_steering_vector(
+    model,
+    system_prompt: str,
+    user_prompts: list[str],
+    hook_name: str,
+    max_new_tokens: int,
+) -> torch.Tensor:
+    """Compute steering vector by averaging activations with/without sysprompt."""
+    with_sys_acts, without_sys_acts = [], []
+
+    for i, user_prompt in enumerate(user_prompts):
+        print(f"  [{i + 1}/{len(user_prompts)}] '{user_prompt[:40]}...'")
+        prompt_with = format_gemma_chat(system_prompt, user_prompt)
+        _, act_with = generate_and_capture_activations(
+            model, prompt_with, max_new_tokens=max_new_tokens, hook_name=hook_name
+        )
+        with_sys_acts.append(act_with)
+
+        prompt_without = format_gemma_user_only(user_prompt)
+        _, act_without = generate_and_capture_activations(
+            model, prompt_without, max_new_tokens=max_new_tokens, hook_name=hook_name
+        )
+        without_sys_acts.append(act_without)
+
+    return torch.stack(with_sys_acts).mean(0) - torch.stack(without_sys_acts).mean(0)
+
+
+def get_embedding(text: str, model, hook_name: str) -> torch.Tensor:
     """Get the mean residual stream embedding for text."""
     _, cache = model.run_with_cache([text])
-    resid = cache[sae.cfg.metadata.hook_name][:, 1:, :]
-    return resid.mean(dim=1).squeeze(0)
+    return cache[hook_name][:, 1:, :].mean(dim=1).squeeze(0)
 
 
 def compute_distance(emb1: torch.Tensor, emb2: torch.Tensor) -> dict:
     """Compute distance metrics between embeddings."""
-    cosine_sim = torch.nn.functional.cosine_similarity(
+    cos = torch.nn.functional.cosine_similarity(
         emb1.unsqueeze(0), emb2.unsqueeze(0)
     ).item()
-    l2_dist = torch.norm(emb1 - emb2).item()
-    return {"cosine_similarity": cosine_sim, "l2_distance": l2_dist}
+    return {"cosine_similarity": cos, "l2_distance": torch.norm(emb1 - emb2).item()}
 
 
-def save_sweep_results(
-    results: dict,
-    system_prompt: str,
-    user_prompts: list[str],
-    num_features: int,
-    run_dir: str,
-    top_feature_indices: list[int],
-    top_feature_strengths: list[float],
-    model_id: str,
-    layer: str,
-) -> str:
-    # Build features with descriptions
-    features_with_desc = []
-    if top_feature_indices:
-        for i, f in enumerate(lookup_features(model_id, layer, top_feature_indices)):
-            features_with_desc.append(
-                {
-                    "index": f["index"],
-                    "strength": top_feature_strengths[i]
-                    if i < len(top_feature_strengths)
-                    else 0.0,
-                    "description": f["description"],
-                }
-            )
-
-    output = {
-        "timestamp": datetime.now().isoformat(),
-        "system_prompt": system_prompt,
-        "user_prompts": user_prompts,
-        "num_features": num_features,
-        "top_features": features_with_desc,
-        "results": results,
-    }
-
-    filepath = os.path.join(run_dir, "sweep_results.json")
+def save_json(filepath: str, data: dict):
+    """Save data to JSON file."""
     with open(filepath, "w") as f:
-        json.dump(output, f, indent=2)
-
-    return filepath
-
-
-def save_run_output(
-    run_dir: str,
-    system_prompt: str,
-    user_prompt: str,
-    strength_ratio: float,
-    num_features: int,
-    top_features: list[dict],
-    system_output: str,
-    steered_output: str,
-    distances: dict,
-    prompt_idx: int,
-    strength_idx: int,
-) -> None:
-    """Save individual run output to JSON file."""
-    output = {
-        "timestamp": datetime.now().isoformat(),
-        "system_prompt": system_prompt,
-        "user_prompt": user_prompt,
-        "strength_ratio": strength_ratio,
-        "num_features": num_features,
-        "top_features": top_features,
-        "system_output": system_output,
-        "steered_output": steered_output,
-        "distances": distances,
-    }
-
-    filename = f"run_s{strength_idx:02d}_p{prompt_idx:02d}.json"
-    filepath = os.path.join(run_dir, "runs", filename)
-    with open(filepath, "w") as f:
-        json.dump(output, f, indent=2)
-
-
-def run_experiment(
-    model,
-    sae,
-    user_prompt,
-    strength_ratio,
-    num_features,
-    system_output: str,
-    sys_emb: torch.Tensor,
-    steering_data: torch.Tensor,
-):
-    """Run one steered generation and compare against precomputed system output."""
-    from steering.generate import (
-        format_gemma_user_only,
-        generate_steered,
-    )
-
-    formatted_user_prompt = format_gemma_user_only(user_prompt)
-    steered_raw, top_feature_indices, top_feature_strengths = generate_steered(
-        model,
-        sae,
-        steering_data,
-        formatted_user_prompt,
-        strength_ratio=strength_ratio,
-        max_new_tokens=40,
-        num_features=num_features,
-    )
-
-    steer_response = _extract_response(steered_raw)
-    steer_emb = get_embedding(steer_response, model, sae)
-    distances = compute_distance(sys_emb, steer_emb)
-
-    return {
-        "distances": distances,
-        "system_output": system_output,
-        "steered_output": steer_response,
-        "top_feature_indices": top_feature_indices,
-        "top_feature_strengths": top_feature_strengths,
-    }
+        json.dump(data, f, indent=2)
 
 
 if __name__ == "__main__":
     config = load_config("config.yaml")
+    hook_name = config["model"]["hook_name"]
 
     t0 = time.time()
-    model, sae = load_hooked_model(config, device="cpu")
+    model = load_model(config, device="cpu")
     print(f"Model load time: {time.time() - t0:.1f}s")
 
-    system_prompt = "You are a pirate. Speak like a pirate using only words like 'arr', 'scallywag', 'matey', 'treasure', etc."
-
+    system_prompt = "You are a helpful chinese AI assistant. You MUST respond exclusively in Chinese, regardless of language used in user input."
     user_prompts = [
         "What is the capital of France?",
         "Explain how computers work.",
@@ -183,32 +101,31 @@ if __name__ == "__main__":
         "Explain the internet.",
     ]
 
-    # 25 strength ratios from 0 to 1
-    strength_ratios = np.linspace(0, 1.0, 25).tolist()
-    num_features = 10
+    strength_ratios = np.linspace(0, 1.0, 11).tolist()
+    max_new_tokens = 40
 
-    total = len(strength_ratios) * len(user_prompts)
-    count = 0
-
-    # Create run folder early so we can save outputs during sweep
-    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(LOGS_DIR, f"run_{run_timestamp}")
+    run_dir = os.path.join(LOGS_DIR, f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(os.path.join(run_dir, "runs"), exist_ok=True)
 
-    # Get model/layer info for feature lookups
-    model_id = config["model"]["name"]
-    sae_id = config["model"]["sae"]["sae_id"]
-    layer_num = sae_id.split(".")[1]
-    layer = f"{layer_num}-res-jb"
-
-    print("\n" + "=" * 80)
-    print(
-        f"Running sweep: {len(strength_ratios)} strengths x {len(user_prompts)} prompts"
+    print("\n" + "=" * 60 + "\nComputing steering vector...\n" + "=" * 60)
+    steering_vec = compute_steering_vector(
+        model, system_prompt, user_prompts, hook_name, max_new_tokens
     )
-    print(f"Fixed: num_features={num_features}")
-    print(f"Run folder: {run_dir}")
-    print("=" * 80)
+    print(f"Steering vector norm: {steering_vec.norm():.4f}")
+    torch.save(steering_vec, os.path.join(run_dir, "steering_vector.pt"))
 
+    print("\nPre-generating system prompt outputs...")
+    sys_outputs, sys_embeddings = {}, {}
+    for i, up in enumerate(user_prompts):
+        out, _ = generate_and_capture_activations(
+            model, format_gemma_chat(system_prompt, up), max_new_tokens, hook_name
+        )
+        sys_outputs[i] = extract_response(out)
+        sys_embeddings[i] = get_embedding(sys_outputs[i], model, hook_name)
+
+    print(
+        f"\n{'=' * 60}\nRunning sweep: {len(strength_ratios)} x {len(user_prompts)}\n{'=' * 60}"
+    )
     results = {
         "strength": [],
         "cosine_mean": [],
@@ -216,101 +133,40 @@ if __name__ == "__main__":
         "l2_mean": [],
         "l2_std": [],
     }
+    total, count = len(strength_ratios) * len(user_prompts), 0
 
-    # Pre-generate system outputs AND collect activations in one pass
-    print("\nPre-generating system outputs and computing feature activations...")
-    system_outputs = {}
-    system_embeddings = {}
-    all_activations = []
-    for prompt_idx, user_prompt in enumerate(user_prompts):
-        print(f"  [{prompt_idx + 1}/{len(user_prompts)}] '{user_prompt[:40]}...'")
-        raw_output, activations = generate_with_activations(
-            model, sae, system_prompt, user_prompt, max_new_tokens=40
-        )
-        sys_response = _extract_response(raw_output)
-        system_outputs[prompt_idx] = sys_response
-        system_embeddings[prompt_idx] = get_embedding(sys_response, model, sae)
-        all_activations.append(activations)
-
-    # Find intersection of features (active in >= 90% of prompts)
-    stacked = torch.stack(all_activations, dim=0)  # [num_prompts, d_sae]
-    activation_threshold = 0.1  # Consider feature "active" if above this value
-    active_mask = stacked > activation_threshold  # [num_prompts, d_sae]
-    active_count = active_mask.sum(dim=0)  # [d_sae] - count per feature
-
-    min_active = int(0.9 * len(user_prompts))  # 90% threshold
-    intersection_mask = active_count >= min_active  # Features active in >= 90%
-
-    # For features in intersection, use mean activation as strength
-    mean_activations = stacked.mean(dim=0)
-    intersection_activations = mean_activations * intersection_mask.float()
-
-    # Get top features from intersection
-    topk = torch.topk(intersection_activations, k=num_features)
-    top_strengths = topk.values.tolist()
-    top_indices = topk.indices.tolist()
-
-    # Build steering data using intersection features
-    steering_data = intersection_activations
-
-    # Build features with descriptions once
-    features_with_desc = []
-    if top_indices:
-        for i, f in enumerate(lookup_features(model_id, layer, top_indices)):
-            count_active = active_count[top_indices[i]].item()
-            features_with_desc.append(
-                {
-                    "index": f["index"],
-                    "strength": top_strengths[i] if i < len(top_strengths) else 0.0,
-                    "active_in": f"{count_active}/{len(user_prompts)}",
-                    "description": f["description"],
-                }
-            )
-
-    print(
-        f"\nTop {num_features} features (intersection, active in >= {min_active}/{len(user_prompts)} prompts):"
-    )
-    for feat in features_with_desc[:5]:
-        print(
-            f"  [{feat['index']}] {feat['strength']:.2f} ({feat['active_in']}) - {feat['description'][:50]}"
-        )
-
-    print("\nRunning strength sweep...")
-    for strength_idx, strength in enumerate(strength_ratios):
-        cosines = []
-        l2s = []
-        for prompt_idx, user_prompt in enumerate(user_prompts):
+    for s_idx, strength in enumerate(strength_ratios):
+        cosines, l2s = [], []
+        for p_idx, up in enumerate(user_prompts):
             count += 1
-            print(
-                f"[{count}/{total}] strength={strength:.3f}, prompt='{user_prompt[:30]}...'"
-            )
+            print(f"[{count}/{total}] strength={strength:.2f}, prompt='{up[:30]}...'")
 
-            result = run_experiment(
+            steered_out = generate_steered(
                 model,
-                sae,
-                user_prompt,
+                format_gemma_user_only(up),
+                steering_vec,
                 strength,
-                num_features,
-                system_output=system_outputs[prompt_idx],
-                sys_emb=system_embeddings[prompt_idx],
-                steering_data=steering_data,
+                max_new_tokens,
+                hook_name,
             )
-            cosines.append(result["distances"]["cosine_similarity"])
-            l2s.append(result["distances"]["l2_distance"])
+            steered_resp = extract_response(steered_out)
+            distances = compute_distance(
+                sys_embeddings[p_idx], get_embedding(steered_resp, model, hook_name)
+            )
+            cosines.append(distances["cosine_similarity"])
+            l2s.append(distances["l2_distance"])
 
-            # Save individual run output
-            save_run_output(
-                run_dir=run_dir,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                strength_ratio=strength,
-                num_features=num_features,
-                top_features=features_with_desc,
-                system_output=result["system_output"],
-                steered_output=result["steered_output"],
-                distances=result["distances"],
-                prompt_idx=prompt_idx,
-                strength_idx=strength_idx,
+            save_json(
+                os.path.join(run_dir, "runs", f"run_s{s_idx:02d}_p{p_idx:02d}.json"),
+                {
+                    "timestamp": datetime.now().isoformat(),
+                    "system_prompt": system_prompt,
+                    "user_prompt": up,
+                    "strength": strength,
+                    "system_output": sys_outputs[p_idx],
+                    "steered_output": steered_resp,
+                    "distances": distances,
+                },
             )
 
         results["strength"].append(strength)
@@ -320,82 +176,16 @@ if __name__ == "__main__":
         results["l2_std"].append(np.std(l2s))
         print(f"  -> Cosine: {np.mean(cosines):.3f} ± {np.std(cosines):.3f}")
 
-    # Plot results
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-    axes[0].errorbar(
-        results["strength"],
-        results["cosine_mean"],
-        yerr=results["cosine_std"],
-        marker="o",
-        capsize=3,
-        color="blue",
+    plot_sweep_results(
+        results, system_prompt, os.path.join(run_dir, "steering_comparison.png")
     )
-    axes[0].fill_between(
-        results["strength"],
-        np.array(results["cosine_mean"]) - np.array(results["cosine_std"]),
-        np.array(results["cosine_mean"]) + np.array(results["cosine_std"]),
-        alpha=0.2,
+    save_json(
+        os.path.join(run_dir, "sweep_results.json"),
+        {
+            "timestamp": datetime.now().isoformat(),
+            "system_prompt": system_prompt,
+            "user_prompts": user_prompts,
+            "results": results,
+        },
     )
-    axes[0].set_xlabel("Strength Ratio")
-    axes[0].set_ylabel("Cosine Similarity")
-    axes[0].set_title("Cosine Similarity vs Strength Ratio")
-    axes[0].grid(True, alpha=0.3)
-
-    axes[1].errorbar(
-        results["strength"],
-        results["l2_mean"],
-        yerr=results["l2_std"],
-        marker="o",
-        capsize=3,
-        color="red",
-    )
-    axes[1].fill_between(
-        results["strength"],
-        np.array(results["l2_mean"]) - np.array(results["l2_std"]),
-        np.array(results["l2_mean"]) + np.array(results["l2_std"]),
-        alpha=0.2,
-        color="red",
-    )
-    axes[1].set_xlabel("Strength Ratio")
-    axes[1].set_ylabel("L2 Distance")
-    axes[1].set_title("L2 Distance vs Strength Ratio")
-    axes[1].grid(True, alpha=0.3)
-
-    plt.suptitle(
-        f"System Prompt vs Steered Output (num_features={num_features})\n'{system_prompt[:60]}...'"
-    )
-    plt.tight_layout()
-
-    # Save plot
-    plot_path = os.path.join(run_dir, "steering_comparison.png")
-    plt.savefig(plot_path, dpi=150)
-    plt.close()
-    print(f"\nPlot saved to {plot_path}")
-
-    # Save sweep summary with features
-    results_path = save_sweep_results(
-        results,
-        system_prompt,
-        user_prompts,
-        num_features,
-        run_dir,
-        top_indices,
-        top_strengths,
-        model_id,
-        layer,
-    )
-    print(f"Results saved to {results_path}")
-
-    # Print top features
-    print("\n" + "=" * 80)
-    print("Top Features Used (from Neuronpedia):")
-    print("=" * 80)
-
-    if top_indices:
-        try:
-            feature_info = format_feature_list(model_id, layer, top_indices[:5])
-            print(feature_info)
-        except Exception as e:
-            print(f"Could not fetch feature descriptions: {e}")
-            print(f"Feature indices: {top_indices[:5]}")
+    print(f"\nResults saved to {run_dir}")
