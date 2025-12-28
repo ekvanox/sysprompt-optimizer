@@ -1,10 +1,17 @@
 [project]
 name = "sysprompt-optimizer"
 version = "0.1.0"
-description = "Add your description here"
+description = "Remove system prompts by introducing steering vectors"
 readme = "README.md"
-requires-python = ">=3.13"
-dependencies = []
+requires-python = ">=3.10.0,<3.13"
+dependencies = [
+    "torch>=2.0.0",
+    "sae-lens==6.22.3",
+    "transformers==4.55.4",
+    "transformer-lens==2.16.1",
+    "matplotlib>=3.10.8",
+    "requests>=2.31.0",
+]
 
 [dependency-groups]
 dev = [
