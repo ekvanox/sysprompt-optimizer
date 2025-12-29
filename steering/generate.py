@@ -53,16 +53,12 @@ def generate_steered(
     model: HookedTransformer,
     prompt: str,
     steering_vec: torch.Tensor,
-    strength: float = 0.5,
+    strength: float = 1.0,
     max_new_tokens: int = 50,
     hook_name: str = DEFAULT_HOOK_NAME,
 ) -> str:
-    """Generate with steering vector added to residual stream."""
-    steering_vec_normalized = steering_vec / steering_vec.norm()
-
     def steering_hook(resid, hook):
-        current_norm = resid.norm(dim=-1).mean()
-        return resid + steering_vec_normalized * current_norm * strength
+        return resid + (steering_vec * strength)
 
     with model.hooks(fwd_hooks=[(hook_name, steering_hook)]):
         output = model.generate(
