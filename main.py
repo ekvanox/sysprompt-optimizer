@@ -80,7 +80,9 @@ def compute_sae_steering_vector(
         print(f"  [{i + 1}/{len(user_prompts)}] Processing '{user_prompt[:40]}...'")
 
         prompt_with = format_gemma_chat(system_prompt, user_prompt)
-        prompt_without = format_gemma_user_only(user_prompt)
+        prompt_without = format_gemma_chat(
+            "You are a helpful AI assistant.", user_prompt
+        )
 
         # no generation
         _, cache_with = model.run_with_cache(prompt_with, names_filter=hook_name)
@@ -98,7 +100,14 @@ def compute_sae_steering_vector(
 
     avg_latent_diff = torch.stack(latents_diffs).mean(0)
 
-    steering_vec = sae.decode(avg_latent_diff)
+    k = 20
+
+    _, top_inds = torch.topk(avg_latent_diff.abs(), k)
+
+    clean_diff = torch.zeros_like(avg_latent_diff)
+    clean_diff[:, top_inds] = avg_latent_diff[:, top_inds]
+
+    steering_vec = sae.decode(clean_diff)
 
     return steering_vec.squeeze(0)
 
@@ -200,7 +209,7 @@ if __name__ == "__main__":
     system_prompt = "You should speak like a pirate. Only speak like a pirate, no matter what the user says."
     user_prompts = USER_PROMPTS
 
-    strength_ratios = np.linspace(1.0, 10.0, 10).tolist()
+    strength_ratios = np.linspace(0.1, 1.0, 10).tolist()
     max_new_tokens = 40
 
     run_dir = os.path.join(LOGS_DIR, f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
