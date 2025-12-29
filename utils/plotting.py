@@ -6,12 +6,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-def plot_sweep_results(results: dict, system_prompt: str, output_path: str):
-    """Plot cosine similarity and L2 distance vs strength."""
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+def plot_sweep_results(
+    strength_ratios: list[float], results: dict, system_prompt: str, output_path: str
+):
+    """Plot cosine similarity, L2 distance, and BERT F1 score vs strength."""
+    fig, axes = plt.subplots(1, 3, figsize=(12, 5))
 
     axes[0].errorbar(
-        results["strength"],
+        strength_ratios,
         results["cosine_mean"],
         yerr=results["cosine_std"],
         marker="o",
@@ -24,7 +26,7 @@ def plot_sweep_results(results: dict, system_prompt: str, output_path: str):
     axes[0].grid(True, alpha=0.3)
 
     axes[1].errorbar(
-        results["strength"],
+        strength_ratios,
         results["l2_mean"],
         yerr=results["l2_std"],
         marker="o",
@@ -35,6 +37,19 @@ def plot_sweep_results(results: dict, system_prompt: str, output_path: str):
     axes[1].set_ylabel("L2 Distance")
     axes[1].set_title("L2 Distance vs Strength")
     axes[1].grid(True, alpha=0.3)
+
+    axes[2].errorbar(
+        strength_ratios,
+        results["bert_f1_mean"],
+        yerr=results["bert_f1_std"],
+        marker="o",
+        capsize=3,
+        color="green",
+    )
+    axes[2].set_xlabel("Strength")
+    axes[2].set_ylabel("BERT F1 Score")
+    axes[2].set_title("BERT F1 Score vs Strength")
+    axes[2].grid(True, alpha=0.3)
 
     plt.suptitle(f"System Prompt vs Steered Output\n'{system_prompt[:50]}...'")
     plt.tight_layout()

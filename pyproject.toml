@@ -12,6 +12,8 @@ dependencies = [
     "matplotlib>=3.10.8",
     "requests>=2.31.0",
     "sentence-transformers>=5.2.0",
+    "instructorembedding>=1.0.1",
+    "bert-score>=0.3.13",
 ]
 
 [dependency-groups]
