@@ -7,6 +7,8 @@ from datetime import datetime
 
 import numpy as np
 import torch
+from sae_lens import SAE
+from transformer_lens import HookedTransformer
 
 from evaluator import Evaluator
 from prompts.user_prompts import USER_PROMPTS
@@ -60,6 +62,47 @@ def compute_steering_vector(
     return (torch.stack(with_sys_acts) - torch.stack(without_sys_acts)).mean(0)
 
 
+def compute_sae_steering_vector(
+    model: HookedTransformer,
+    sae: SAE,
+    system_prompt: str,
+    user_prompts: list[str],
+    hook_name: str,
+) -> torch.Tensor:
+    """
+    Computes a steering vector using the last token of the PROMPT.
+    """
+    latents_diffs = []
+
+    sae.eval()
+
+    for i, user_prompt in enumerate(user_prompts):
+        print(f"  [{i + 1}/{len(user_prompts)}] Processing '{user_prompt[:40]}...'")
+
+        prompt_with = format_gemma_chat(system_prompt, user_prompt)
+        prompt_without = format_gemma_user_only(user_prompt)
+
+        # no generation
+        _, cache_with = model.run_with_cache(prompt_with, names_filter=hook_name)
+        _, cache_without = model.run_with_cache(prompt_without, names_filter=hook_name)
+
+        act_with = cache_with[hook_name][:, -1, :]
+        act_without = cache_without[hook_name][:, -1, :]
+
+        with torch.no_grad():
+            latent_with = sae.encode(act_with)
+            latent_without = sae.encode(act_without)
+
+            diff = latent_with - latent_without
+            latents_diffs.append(diff)
+
+    avg_latent_diff = torch.stack(latents_diffs).mean(0)
+
+    steering_vec = sae.decode(avg_latent_diff)
+
+    return steering_vec.squeeze(0)
+
+
 def save_json(filepath: str, data: dict):
     """Save data to JSON file."""
     with open(filepath, "w") as f:
@@ -79,15 +122,16 @@ def compute_statistics(metrics: list[dict]) -> dict:
 
 
 def run_sweep(
-    model,
-    evaluator,
-    system_prompt,
-    user_prompts,
-    strength_ratios,
-    max_new_tokens,
-    hook_name,
-    steering_vec,
-    run_dir,
+    model: HookedTransformer,
+    evaluator: Evaluator,
+    system_prompt: str,
+    sys_outputs,
+    user_prompts: list[str],
+    strength_ratios: np.ndarray,
+    max_new_tokens: int,
+    hook_name: str,
+    steering_vec: torch.Tensor,
+    run_dir: str,
 ):
     """Run the sweep."""
     total, count = len(strength_ratios) * len(user_prompts), 0
@@ -128,11 +172,13 @@ def run_sweep(
 
             metrics_by_strength.append(sample_metrics)
 
+        stats = compute_statistics(metrics_by_strength)
         print(
-            f"-> Cosine similarity: {compute_statistics(metrics_by_strength)['cosine_mean']:.3f} ± {compute_statistics(metrics_by_strength)['cosine_std']:.3f} for strength: {strength:.2f}"
+            f"-> Cosine similarity: {stats['cosine_mean']:.3f} ± {stats['cosine_std']:.3f} for strength: {strength:.2f}"
         )
-        metrics.extend(metrics_by_strength)
-    results = compute_statistics(metrics)
+        metrics.append(stats)
+
+    results = {k: [d[k] for d in metrics] for k in metrics[0].keys()}
 
     return results
 
@@ -144,26 +190,29 @@ if __name__ == "__main__":
 
     t0 = time.time()
     model = load_model(config, device=device)
+    sae = SAE.from_pretrained(
+        release="gemma-2b-res-jb", sae_id=hook_name, device="cuda"
+    )
+
     evaluator = Evaluator(device=device)
     print(f"Model load time: {time.time() - t0:.1f}s")
 
     system_prompt = "You should speak like a pirate. Only speak like a pirate, no matter what the user says."
     user_prompts = USER_PROMPTS
 
-    strength_ratios = np.linspace(0, 1.0, 11).tolist()
+    strength_ratios = np.linspace(1.0, 10.0, 10).tolist()
     max_new_tokens = 40
 
     run_dir = os.path.join(LOGS_DIR, f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(os.path.join(run_dir, "runs"), exist_ok=True)
 
     print("\n" + "=" * 60 + "\nComputing steering vector...\n" + "=" * 60)
-    steering_vec = compute_steering_vector(
+    steering_vec = compute_sae_steering_vector(
         model,
+        sae,
         system_prompt,
         user_prompts,
         hook_name,
-        max_new_tokens,
-        reduction_method="mean",
     )
     print(f"Steering vector norm: {steering_vec.norm():.4f}")
     torch.save(steering_vec, os.path.join(run_dir, "steering_vector.pt"))
@@ -180,6 +229,7 @@ if __name__ == "__main__":
         model,
         evaluator,
         system_prompt,
+        sys_outputs,
         user_prompts,
         strength_ratios,
         max_new_tokens,
