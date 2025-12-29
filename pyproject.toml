@@ -11,6 +11,7 @@ dependencies = [
     "transformer-lens==2.16.1",
     "matplotlib>=3.10.8",
     "requests>=2.31.0",
+    "sentence-transformers>=5.2.0",
 ]
 
 [dependency-groups]

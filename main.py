@@ -7,6 +7,7 @@ from datetime import datetime
 
 import numpy as np
 import torch
+from sentence_transformers import SentenceTransformer
 
 from steering.generate import (
     extract_response,
@@ -28,6 +29,7 @@ def compute_steering_vector(
     user_prompts: list[str],
     hook_name: str,
     max_new_tokens: int,
+    reduction_method: str = "mean",
 ) -> torch.Tensor:
     """Compute steering vector by averaging activations with/without sysprompt."""
     with_sys_acts, without_sys_acts = [], []
@@ -36,23 +38,30 @@ def compute_steering_vector(
         print(f"  [{i + 1}/{len(user_prompts)}] '{user_prompt[:40]}...'")
         prompt_with = format_gemma_chat(system_prompt, user_prompt)
         _, act_with = generate_and_capture_activations(
-            model, prompt_with, max_new_tokens=max_new_tokens, hook_name=hook_name
+            model,
+            prompt_with,
+            max_new_tokens=max_new_tokens,
+            hook_name=hook_name,
+            reduction_method=reduction_method,
         )
         with_sys_acts.append(act_with)
 
         prompt_without = format_gemma_user_only(user_prompt)
         _, act_without = generate_and_capture_activations(
-            model, prompt_without, max_new_tokens=max_new_tokens, hook_name=hook_name
+            model,
+            prompt_without,
+            max_new_tokens=max_new_tokens,
+            hook_name=hook_name,
+            reduction_method=reduction_method,
         )
         without_sys_acts.append(act_without)
 
-    return torch.stack(with_sys_acts).mean(0) - torch.stack(without_sys_acts).mean(0)
+    return (torch.stack(with_sys_acts) - torch.stack(without_sys_acts)).mean(0)
 
 
-def get_embedding(text: str, model, hook_name: str) -> torch.Tensor:
-    """Get the mean residual stream embedding for text."""
-    _, cache = model.run_with_cache([text])
-    return cache[hook_name][:, 1:, :].mean(dim=1).squeeze(0)
+def get_embedding(text: str, embedding_model: SentenceTransformer) -> torch.Tensor:
+    """Get the embedding of text."""
+    return embedding_model.encode(text, convert_to_tensor=True)
 
 
 def compute_distance(emb1: torch.Tensor, emb2: torch.Tensor) -> dict:
@@ -72,12 +81,14 @@ def save_json(filepath: str, data: dict):
 if __name__ == "__main__":
     config = load_config("config.yaml")
     hook_name = config["model"]["hook_name"]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     t0 = time.time()
-    model = load_model(config, device="cpu")
+    model = load_model(config)
+    embedding_model = SentenceTransformer("BAAI/bge-m3", device=device)
     print(f"Model load time: {time.time() - t0:.1f}s")
 
-    system_prompt = "You are a helpful chinese AI assistant. You MUST respond exclusively in Chinese, regardless of language used in user input."
+    system_prompt = "You should speak like a pirate. Only speak like a pirate, no matter what the user says."
     user_prompts = [
         "What is the capital of France?",
         "Explain how computers work.",
@@ -109,7 +120,12 @@ if __name__ == "__main__":
 
     print("\n" + "=" * 60 + "\nComputing steering vector...\n" + "=" * 60)
     steering_vec = compute_steering_vector(
-        model, system_prompt, user_prompts, hook_name, max_new_tokens
+        model,
+        system_prompt,
+        user_prompts,
+        hook_name,
+        max_new_tokens,
+        reduction_method="mean",
     )
     print(f"Steering vector norm: {steering_vec.norm():.4f}")
     torch.save(steering_vec, os.path.join(run_dir, "steering_vector.pt"))
@@ -121,7 +137,7 @@ if __name__ == "__main__":
             model, format_gemma_chat(system_prompt, up), max_new_tokens, hook_name
         )
         sys_outputs[i] = extract_response(out)
-        sys_embeddings[i] = get_embedding(sys_outputs[i], model, hook_name)
+        sys_embeddings[i] = get_embedding(sys_outputs[i], embedding_model)
 
     print(
         f"\n{'=' * 60}\nRunning sweep: {len(strength_ratios)} x {len(user_prompts)}\n{'=' * 60}"
@@ -151,7 +167,7 @@ if __name__ == "__main__":
             )
             steered_resp = extract_response(steered_out)
             distances = compute_distance(
-                sys_embeddings[p_idx], get_embedding(steered_resp, model, hook_name)
+                sys_embeddings[p_idx], get_embedding(steered_resp, embedding_model)
             )
             cosines.append(distances["cosine_similarity"])
             l2s.append(distances["l2_distance"])

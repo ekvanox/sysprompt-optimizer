@@ -21,6 +21,7 @@ def generate_and_capture_activations(
     prompt: str,
     max_new_tokens: int = 50,
     hook_name: str = DEFAULT_HOOK_NAME,
+    reduction_method: str = "mean",
 ) -> tuple[str, torch.Tensor]:
     """Generate tokens and capture mean residual stream activation."""
     all_activations = []
@@ -36,11 +37,16 @@ def generate_and_capture_activations(
 
     if all_activations:
         stacked = torch.stack(all_activations, dim=0).squeeze(1)
-        mean_activation = stacked.mean(dim=0)
+        if reduction_method == "mean":
+            activation = stacked.mean(dim=0)
+        elif reduction_method == "last":
+            activation = stacked[-1]
+        else:
+            raise ValueError(f"Invalid reduction method: {reduction_method}")
     else:
-        mean_activation = torch.zeros(model.cfg.d_model)
+        activation = torch.zeros(model.cfg.d_model)
 
-    return output, mean_activation
+    return output, activation
 
 
 def generate_steered(
